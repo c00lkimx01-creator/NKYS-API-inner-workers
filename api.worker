@@ -3,7 +3,7 @@
 //   /api/v1/search?q={keyword}
 //   /api/v1/shorts/{videoId}
 //   /api/v1/videos/{videoId}
-//   /api/v1/channels/{channelId}
+//   /api/v1/channels/{channelId}(&videos&shorts&live&playlist)  ※指定なしで全部
 //   /api/v1/comments/{videoId}
 
 const YT = "https://www.youtube.com/youtubei/v1";
@@ -107,17 +107,49 @@ function mapShortLockup(s) {
 }
 
 function mapChannel(c) {
+  // 新レイアウトでは subscriberCountText に @handle、videoCountText に登録者数が入る
+  const a = text(c.subscriberCountText), b = text(c.videoCountText);
+  const handle = [a, b].find((t) => t.startsWith("@"));
+  const subs = [b, a].find((t) => t && !t.startsWith("@"));
   return {
     type: "channel",
     channelId: c.channelId,
     title: text(c.title),
-    subscriberText: text(c.videoCountText || c.subscriberCountText),
-    thumbnails: c.thumbnail?.thumbnails ?? [],
+    handle,
+    subscriberText: subs,
+    description: text(c.descriptionSnippet),
+    verified: collect(c, "metadataBadgeRenderer").length > 0,
+    thumbnails: (c.thumbnail?.thumbnails ?? []).map((t) => ({ ...t, url: t.url?.startsWith("//") ? "https:" + t.url : t.url })),
+  };
+}
+
+function mapPlaylist(p) {
+  return {
+    type: "playlist",
+    playlistId: p.playlistId,
+    title: text(p.title),
+    videoCount: text(p.videoCountText || p.videoCountShortText),
+    thumbnails: p.thumbnail?.thumbnails ?? p.thumbnails?.[0]?.thumbnails ?? [],
+  };
+}
+
+function mapLockupPlaylist(v) {
+  const meta = v.metadata?.lockupMetadataViewModel ?? {};
+  const thumb = v.contentImage?.collectionThumbnailViewModel?.primaryThumbnail?.thumbnailViewModel ?? {};
+  return {
+    type: "playlist",
+    playlistId: v.contentId,
+    title: meta.title?.content,
+    videoCount: collect(thumb, "thumbnailBadgeViewModel").map((b) => b.text).find(Boolean),
+    thumbnails: thumb.image?.sources ?? [],
   };
 }
 
 function parseSearchResults(data) {
+  const lockups = collect(data, "lockupViewModel");
   return [
+    ...lockups.filter((l) => l.contentType === "LOCKUP_CONTENT_TYPE_PLAYLIST").map(mapLockupPlaylist),
+    ...collect(data, "playlistRenderer").map(mapPlaylist),
     ...collect(data, "channelRenderer").map(mapChannel),
     ...collect(data, "reelItemRenderer").map(mapShort),
     ...collect(data, "shortsLockupViewModel").map(mapShortLockup),
@@ -129,8 +161,12 @@ function nextToken(data) {
   return collect(data, "continuationCommand").map((c) => c.token).find(Boolean);
 }
 
-async function search(q, more = 0) {
-  let data = await yt("search", { query: q });
+// type=channel|video|playlist で絞り込み
+const SEARCH_FILTER = { channel: "EgIQAg%3D%3D", video: "EgIQAQ%3D%3D", playlist: "EgIQAw%3D%3D" };
+
+async function search(q, more = 0, type) {
+  const params = SEARCH_FILTER[type] ? decodeURIComponent(SEARCH_FILTER[type]) : undefined;
+  let data = await yt("search", { query: q, ...(params && { params }) });
   const results = parseSearchResults(data);
   let page = 0;
   let token = nextToken(data);
@@ -140,7 +176,18 @@ async function search(q, more = 0) {
     token = nextToken(data);
     page++;
   }
-  return { query: q, page, hasMore: !!token, results };
+  const seen = new Set();
+  const uniq = results.filter((r) => {
+    const k = r.type + (r.videoId || r.channelId || r.playlistId);
+    if (!(r.videoId || r.channelId || r.playlistId) || seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+  return {
+    query: q, type: type || "all", page, hasMore: !!token,
+    channels: uniq.filter((r) => r.type === "channel"),
+    results: uniq,
+  };
 }
 
 async function video(videoId) {
@@ -209,22 +256,123 @@ async function shorts(videoId, more = 0) {
   return { ...v, type: "short", url: `https://www.youtube.com/shorts/${videoId}`, next };
 }
 
-async function channel(channelId) {
-  const data = await yt("browse", { browseId: channelId });
+// ===== チャンネル =====
+const TAB_PARAMS = {
+  videos: "EgZ2aWRlb3PyBgQKAjoA",
+  shorts: "EgZzaG9ydHPyBgUKA5oBAA==",
+  live: "EgdzdHJlYW1z8gYECgJ6AA==",
+  playlists: "EglwbGF5bGlzdHPyBgQKAkIA",
+};
+const TAB_PATH = { videos: "/videos", shorts: "/shorts", live: "/streams", playlists: "/playlists" };
+
+// @handle / URL を channelId (UC...) に解決
+async function resolveChannelId(id) {
+  if (/^UC[\w-]{22}$/.test(id)) return id;
+  const path = id.startsWith("@") ? id : id.startsWith("http") ? null : `@${id}`;
+  const url = path ? `https://www.youtube.com/${path}` : id;
+  const r = await yt("navigation/resolve_url", { url });
+  return r.endpoint?.browseEndpoint?.browseId ?? id;
+}
+
+function channelMeta(data, channelId) {
   const meta = data.metadata?.channelMetadataRenderer ?? {};
-  const videos = [
-    ...collect(data, "videoRenderer"),
-    ...collect(data, "gridVideoRenderer"),
-  ].map(mapVideo);
+  const header = data.header?.pageHeaderRenderer?.content?.pageHeaderViewModel ?? {};
+  const c4 = data.header?.c4TabbedHeaderRenderer ?? {};
+  const rows = header.metadata?.contentMetadataViewModel?.metadataRows ?? [];
+  const parts = rows.flatMap((r) => r.metadataParts ?? []).map((p) => p.text?.content).filter(Boolean);
+  const micro = data.microformat?.microformatDataRenderer ?? {};
   return {
-    channelId,
+    channelId: meta.externalId ?? channelId,
     title: meta.title,
+    handle: parts.find((p) => p.startsWith("@")) ?? text(c4.channelHandleText),
     description: meta.description,
+    subscriberText: parts.find((p) => /登録者|subscriber/i.test(p)) ?? text(c4.subscriberCountText),
+    videoCountText: parts.find((p) => /本の動画|videos?$/i.test(p)) ?? text(c4.videosCountText),
     avatar: meta.avatar?.thumbnails ?? [],
+    banner: header.banner?.imageBannerViewModel?.image?.sources ?? c4.banner?.thumbnails ?? [],
     vanityUrl: meta.vanityChannelUrl,
+    channelUrl: meta.channelUrl,
+    rssUrl: meta.rssUrl,
     keywords: meta.keywords,
-    videos,
+    tags: micro.tags ?? [],
+    isFamilySafe: meta.isFamilySafe,
+    availableCountryCodes: undefined,
+    verified: collect(data.header ?? {}, "metadataBadgeRenderer").length > 0 || JSON.stringify(data.header ?? {}).includes("CHECK_CIRCLE"),
   };
+}
+
+function findTabParams(data, kind) {
+  const tabs = collect(data, "tabRenderer");
+  const t = tabs.find((t) => t.endpoint?.commandMetadata?.webCommandMetadata?.url?.endsWith(TAB_PATH[kind]));
+  return t?.endpoint?.browseEndpoint?.params ?? TAB_PARAMS[kind];
+}
+
+function selectedTab(data) {
+  return collect(data, "tabRenderer").find((t) => t.selected) ?? data;
+}
+
+function parseTab(data, kind) {
+  const root = data.onResponseReceivedActions ? data : selectedTab(data);
+  if (kind === "shorts") return parseShorts(root);
+  if (kind === "playlists") {
+    return [
+      ...collect(root, "gridPlaylistRenderer").map(mapPlaylist),
+      ...collect(root, "lockupViewModel").filter((l) => l.contentType === "LOCKUP_CONTENT_TYPE_PLAYLIST").map(mapLockupPlaylist),
+    ];
+  }
+  const lock = collect(root, "lockupViewModel").filter((l) => l.contentType !== "LOCKUP_CONTENT_TYPE_PLAYLIST").map((l) => {
+    const m = mapLockupVideo(l);
+    if (kind === "live") {
+      const badges = collect(l, "thumbnailBadgeViewModel").map((b) => `${b.text} ${b.badgeStyle}`).join(" ");
+      m.type = "live";
+      m.isLiveNow = /LIVE|ライブ/i.test(badges);
+      m.isUpcoming = /UPCOMING|予定/i.test(badges);
+    }
+    return m;
+  });
+  return [...lock, ...[...collect(root, "videoRenderer"), ...collect(root, "gridVideoRenderer")].map((v) => {
+    const m = mapVideo(v);
+    if (kind === "live") {
+      const badges = collect(v, "metadataBadgeRenderer").map((b) => b.style);
+      m.type = "live";
+      m.isLiveNow = badges.includes("BADGE_STYLE_TYPE_LIVE_NOW") || !!v.thumbnailOverlays?.some((o) => o.thumbnailOverlayTimeStatusRenderer?.style === "LIVE");
+      m.isUpcoming = !!v.upcomingEventData;
+      m.startTime = v.upcomingEventData?.startTime ? Number(v.upcomingEventData.startTime) : undefined;
+    }
+    return m;
+  })];
+}
+
+async function channelTab(channelId, base, kind, more = 0) {
+  const params = findTabParams(base, kind);
+  let data;
+  try {
+    data = await yt("browse", { browseId: channelId, params });
+  } catch {
+    return { items: [], hasMore: false, error: "tab not available" };
+  }
+  const items = parseTab(data, kind);
+  let token = nextToken(selectedTab(data));
+  let page = 0;
+  while (page < more && token) {
+    data = await yt("browse", { continuation: token });
+    items.push(...parseTab(data, kind));
+    token = nextToken(data);
+    page++;
+  }
+  return { items, hasMore: !!token, continuation: token };
+}
+
+async function channel(rawId, kinds, more = 0) {
+  const channelId = await resolveChannelId(rawId);
+  const base = await yt("browse", { browseId: channelId });
+  const result = { ...channelMeta(base, channelId) };
+  const tabs = await Promise.all(kinds.map((k) => channelTab(channelId, base, k, more)));
+  kinds.forEach((k, i) => {
+    result[k] = tabs[i].items;
+    result[`${k}HasMore`] = tabs[i].hasMore;
+  });
+  return result;
 }
 
 async function comments(videoId) {
@@ -271,10 +419,10 @@ export default {
       return json({
         message: "Hello The World API",
         endpoints: [
-          "/api/v1/search?q={keyword}",
+          "/api/v1/search?q={keyword}(&type=channel|video|playlist)",
           "/api/v1/shorts/{videoId}",
           "/api/v1/videos/{videoId}",
-          "/api/v1/channels/{channelId}",
+          "/api/v1/channels/{channelId|@handle}(&videos&shorts&live&playlist)",
           "/api/v1/comments/{videoId}",
         ],
       });
@@ -286,7 +434,7 @@ export default {
           const q = url.searchParams.get("q");
           if (!q) return json({ error: "q is required" }, 400);
           const more = Math.max(0, parseInt(url.searchParams.get("more") || "0", 10) || 0);
-          return json(await search(q, more));
+          return json(await search(q, more, url.searchParams.get("type")));
         }
         case "shorts": {
           const more = Math.max(0, parseInt(url.searchParams.get("more") || "0", 10) || 0);
@@ -295,9 +443,18 @@ export default {
         case "videos":
           if (!id) return json({ error: "videoId is required" }, 400);
           return json(await video(id));
-        case "channels":
+        case "channels": {
           if (!id) return json({ error: "channelId is required" }, 400);
-          return json(await channel(id));
+          // /channels/{id}&videos&shorts でも ?videos&shorts でもOK
+          const [cid, ...flags] = decodeURIComponent(id).split("&");
+          const all = ["videos", "shorts", "live", "playlists"];
+          const alias = { playlist: "playlists", streams: "live", stream: "live", video: "videos", short: "shorts" };
+          const req = [...flags, ...url.searchParams.keys()].map((f) => alias[f.split("=")[0]] ?? f.split("=")[0]);
+          let kinds = all.filter((k) => req.includes(k));
+          if (!kinds.length) kinds = all;
+          const more = Math.max(0, parseInt(url.searchParams.get("more") || "0", 10) || 0);
+          return json(await channel(cid, kinds, more));
+        }
         case "comments":
           if (!id) return json({ error: "videoId is required" }, 400);
           return json(await comments(id));
