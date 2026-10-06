@@ -1,0 +1,311 @@
+// Cloudflare Worker ("Hello World" テンプレートに貼り付けて使用)
+// Endpoints:
+//   /api/v1/search?q={keyword}
+//   /api/v1/shorts/{videoId}
+//   /api/v1/videos/{videoId}
+//   /api/v1/channels/{channelId}
+//   /api/v1/comments/{videoId}
+
+const YT = "https://www.youtube.com/youtubei/v1";
+const CLIENT = {
+  client: { clientName: "WEB", clientVersion: "2.20250101.00.00", hl: "ja", gl: "JP" },
+};
+
+const CORS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, OPTIONS",
+  "Access-Control-Allow-Headers": "*",
+};
+
+function json(data, status = 200) {
+  return new Response(JSON.stringify(data, null, 2), {
+    status,
+    headers: { "Content-Type": "application/json; charset=utf-8", ...CORS },
+  });
+}
+
+async function yt(endpoint, body) {
+  const res = await fetch(`${YT}/${endpoint}?prettyPrint=false`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "User-Agent": "Mozilla/5.0" },
+    body: JSON.stringify({ context: CLIENT, ...body }),
+  });
+  if (!res.ok) throw new Error(`YouTube ${endpoint} failed: ${res.status}`);
+  return res.json();
+}
+
+const text = (t) => t?.simpleText ?? t?.runs?.map((r) => r.text).join("") ?? t?.content ?? "";
+
+// 深いJSONから指定キーのオブジェクトを全て収集
+function collect(obj, key, out = []) {
+  if (obj && typeof obj === "object") {
+    for (const k in obj) {
+      if (k === key) out.push(obj[k]);
+      collect(obj[k], key, out);
+    }
+  }
+  return out;
+}
+
+function mapVideo(v) {
+  return {
+    type: "video",
+    videoId: v.videoId,
+    title: text(v.title),
+    author: text(v.ownerText || v.shortBylineText),
+    authorId: (v.ownerText || v.shortBylineText)?.runs?.[0]?.navigationEndpoint?.browseEndpoint?.browseId,
+    lengthText: text(v.lengthText),
+    viewCountText: text(v.viewCountText),
+    publishedText: text(v.publishedTimeText),
+    thumbnails: v.thumbnail?.thumbnails ?? [],
+  };
+}
+
+// 新形式 (lockupViewModel) — 関連動画など
+function mapLockupVideo(v) {
+  const meta = v.metadata?.lockupMetadataViewModel ?? {};
+  const rows = meta.metadata?.contentMetadataViewModel?.metadataRows ?? [];
+  const parts = rows.flatMap((r) => r.metadataParts ?? []).map((p) => p.text?.content).filter(Boolean);
+  const thumb = v.contentImage?.collectionThumbnailViewModel?.primaryThumbnail?.thumbnailViewModel
+    ?? v.contentImage?.thumbnailViewModel ?? {};
+  return {
+    type: "video",
+    videoId: v.contentId ?? v.rendererContext?.commandContext?.onTap?.innertubeCommand?.watchEndpoint?.videoId,
+    title: meta.title?.content,
+    author: meta.image?.decoratedAvatarViewModel?.a11yLabel?.replace(/^チャンネル「|」に移動します$/g, "") || parts[0],
+    authorId: meta.image?.decoratedAvatarViewModel?.rendererContext?.commandContext?.onTap?.innertubeCommand?.browseEndpoint?.browseId,
+    lengthText: collect(v, "thumbnailBadgeViewModel").map((b) => b.text).find((t) => /^\d+:\d+/.test(t || "")),
+    viewCountText: parts.find((p) => /回視聴|views/i.test(p)),
+    publishedText: parts.find((p) => /前$/.test(p)),
+    thumbnails: thumb.image?.sources ?? [],
+  };
+}
+
+function mapShort(s) {
+  return {
+    type: "short",
+    videoId: s.videoId,
+    title: text(s.headline),
+    viewCountText: text(s.viewCountText),
+    thumbnails: s.thumbnail?.thumbnails ?? [],
+    url: `https://www.youtube.com/shorts/${s.videoId}`,
+  };
+}
+
+// 新形式 (shortsLockupViewModel)
+function mapShortLockup(s) {
+  const reel = s.onTap?.innertubeCommand?.reelWatchEndpoint ?? {};
+  const videoId = reel.videoId ?? s.entityId?.replace("shorts-shelf-item-", "");
+  return {
+    type: "short",
+    videoId,
+    title: s.overlayMetadata?.primaryText?.content ?? s.accessibilityText,
+    viewCountText: s.overlayMetadata?.secondaryText?.content,
+    thumbnails: reel.thumbnail?.thumbnails ?? [],
+    url: `https://www.youtube.com/shorts/${videoId}`,
+  };
+}
+
+function mapChannel(c) {
+  return {
+    type: "channel",
+    channelId: c.channelId,
+    title: text(c.title),
+    subscriberText: text(c.videoCountText || c.subscriberCountText),
+    thumbnails: c.thumbnail?.thumbnails ?? [],
+  };
+}
+
+function parseSearchResults(data) {
+  return [
+    ...collect(data, "channelRenderer").map(mapChannel),
+    ...collect(data, "reelItemRenderer").map(mapShort),
+    ...collect(data, "shortsLockupViewModel").map(mapShortLockup),
+    ...collect(data, "videoRenderer").map(mapVideo),
+  ];
+}
+
+function nextToken(data) {
+  return collect(data, "continuationCommand").map((c) => c.token).find(Boolean);
+}
+
+async function search(q, more = 0) {
+  let data = await yt("search", { query: q });
+  const results = parseSearchResults(data);
+  let page = 0;
+  let token = nextToken(data);
+  while (page < more && token) {
+    data = await yt("search", { continuation: token });
+    results.push(...parseSearchResults(data));
+    token = nextToken(data);
+    page++;
+  }
+  return { query: q, page, hasMore: !!token, results };
+}
+
+async function video(videoId) {
+  const [player, next] = await Promise.all([
+    yt("player", { videoId }),
+    yt("next", { videoId }),
+  ]);
+  const d = player.videoDetails ?? {};
+  // 関連動画 (旧形式 compactVideoRenderer + 新形式 lockupVideoViewModel)
+  const related = [
+    ...collect(next, "compactVideoRenderer").map(mapVideo),
+    ...collect(next, "lockupViewModel").map(mapLockupVideo),
+  ].filter((v) => v.videoId && v.videoId !== videoId);
+  return {
+    videoId,
+    title: d.title,
+    description: d.shortDescription,
+    author: d.author,
+    authorId: d.channelId,
+    lengthSeconds: Number(d.lengthSeconds || 0),
+    viewCount: Number(d.viewCount || 0),
+    keywords: d.keywords ?? [],
+    isLive: !!d.isLiveContent,
+    thumbnails: d.thumbnail?.thumbnails ?? [],
+    playability: player.playabilityStatus?.status,
+    formats: player.streamingData?.formats ?? [],
+    adaptiveFormats: player.streamingData?.adaptiveFormats ?? [],
+    hlsUrl: player.streamingData?.hlsManifestUrl,
+    related,
+  };
+}
+
+function parseShorts(data) {
+  return [
+    ...collect(data, "reelItemRenderer").map(mapShort),
+    ...collect(data, "shortsLockupViewModel").map(mapShortLockup),
+  ];
+}
+
+async function shorts(videoId, more = 0) {
+  if (!videoId) {
+    // トレンドのShortsを取得 (more=N で追加ページを読み込む)
+    let data = await yt("search", { query: "#shorts" });
+    const shorts = parseShorts(data);
+    let page = 0;
+    let token = nextToken(data);
+    while (page < more && token) {
+      data = await yt("search", { continuation: token });
+      shorts.push(...parseShorts(data));
+      token = nextToken(data);
+      page++;
+    }
+    return { type: "trending", page, hasMore: !!token, shorts };
+  }
+  const v = await video(videoId);
+  // 次に流れるShortsを3本取得 (トレンドフィードのシーケンスを使用)
+  let next = [];
+  try {
+    const data = await yt("search", { query: "#shorts" });
+    const feed = parseShorts(data).filter((s) => s.videoId && s.videoId !== videoId);
+    const idx = feed.findIndex((s) => s.videoId === videoId);
+    next = (idx >= 0 ? feed.slice(idx + 1) : feed).slice(0, 3);
+  } catch {
+    next = [];
+  }
+  return { ...v, type: "short", url: `https://www.youtube.com/shorts/${videoId}`, next };
+}
+
+async function channel(channelId) {
+  const data = await yt("browse", { browseId: channelId });
+  const meta = data.metadata?.channelMetadataRenderer ?? {};
+  const videos = [
+    ...collect(data, "videoRenderer"),
+    ...collect(data, "gridVideoRenderer"),
+  ].map(mapVideo);
+  return {
+    channelId,
+    title: meta.title,
+    description: meta.description,
+    avatar: meta.avatar?.thumbnails ?? [],
+    vanityUrl: meta.vanityChannelUrl,
+    keywords: meta.keywords,
+    videos,
+  };
+}
+
+async function comments(videoId) {
+  const next = await yt("next", { videoId });
+  const token = collect(next, "continuationCommand")
+    .map((c) => c.token)
+    .find(Boolean);
+  if (!token) return { videoId, comments: [] };
+  const data = await yt("next", { continuation: token });
+
+  // 新形式 (commentEntityPayload)
+  let list = collect(data, "commentEntityPayload").map((c) => ({
+    commentId: c.properties?.commentId,
+    author: c.author?.displayName,
+    authorId: c.author?.channelId,
+    authorThumbnail: c.author?.avatarThumbnailUrl,
+    content: c.properties?.content?.content,
+    publishedText: c.properties?.publishedTime,
+    likeCount: c.toolbar?.likeCountNotliked,
+    replyCount: c.toolbar?.replyCount,
+  }));
+  // 旧形式 (commentRenderer)
+  if (!list.length) {
+    list = collect(data, "commentRenderer").map((c) => ({
+      commentId: c.commentId,
+      author: text(c.authorText),
+      authorId: c.authorEndpoint?.browseEndpoint?.browseId,
+      authorThumbnail: c.authorThumbnail?.thumbnails?.[0]?.url,
+      content: text(c.contentText),
+      publishedText: text(c.publishedTimeText),
+      likeCount: text(c.voteCount),
+    }));
+  }
+  return { videoId, comments: list };
+}
+
+export default {
+  async fetch(request) {
+    if (request.method === "OPTIONS") return new Response(null, { headers: CORS });
+    const url = new URL(request.url);
+    const parts = url.pathname.replace(/\/+$/, "").split("/").filter(Boolean);
+    // ["api","v1",resource,id]
+    if (parts[0] !== "api" || parts[1] !== "v1") {
+      return json({
+        message: "Hello The World API",
+        endpoints: [
+          "/api/v1/search?q={keyword}",
+          "/api/v1/shorts/{videoId}",
+          "/api/v1/videos/{videoId}",
+          "/api/v1/channels/{channelId}",
+          "/api/v1/comments/{videoId}",
+        ],
+      });
+    }
+    const [, , resource, id] = parts;
+    try {
+      switch (resource) {
+        case "search": {
+          const q = url.searchParams.get("q");
+          if (!q) return json({ error: "q is required" }, 400);
+          const more = Math.max(0, parseInt(url.searchParams.get("more") || "0", 10) || 0);
+          return json(await search(q, more));
+        }
+        case "shorts": {
+          const more = Math.max(0, parseInt(url.searchParams.get("more") || "0", 10) || 0);
+          return json(await shorts(id, more));
+        }
+        case "videos":
+          if (!id) return json({ error: "videoId is required" }, 400);
+          return json(await video(id));
+        case "channels":
+          if (!id) return json({ error: "channelId is required" }, 400);
+          return json(await channel(id));
+        case "comments":
+          if (!id) return json({ error: "videoId is required" }, 400);
+          return json(await comments(id));
+        default:
+          return json({ error: "Not Found" }, 404);
+      }
+    } catch (e) {
+      return json({ error: String(e?.message || e) }, 502);
+    }
+  },
+};
